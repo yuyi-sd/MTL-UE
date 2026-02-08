@@ -13,7 +13,6 @@ import madrys
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
-from torch.autograd import Variable
 
 class Evaluator():
     def __init__(self, criterion, data_loader, logger, config):
@@ -158,58 +157,6 @@ class Trainer():
         payload["|gn|"] = grad_norm
         return payload
 
-    def adv_train_batch(self, images, labels, model, optimizer, transform):
-        model.eval()
-        x_natural = images.detach()
-        epsilon = args.epsilon/2
-        alpha = args.step_size/2
-        steps = args.num_steps
-        x_adv = x_natural + 0.001 * torch.randn_like(x_natural).detach()
-        x_adv = x_adv.clamp(0.0, 1.0).detach().requires_grad_()
-        for _ in range(steps):
-            # logits_adv = model(x_adv)
-            if transform is not None:
-                logits_adv = model(transform(x_adv))
-            else:
-                logits_adv = model(x_adv)
-            loss_adv = self.criterion(logits_adv, labels)
-            grad = torch.autograd.grad(loss_adv, [x_adv])[0]
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
-            x_adv = x_adv.clamp(0.0, 1.0).detach().requires_grad_()
-
-        model.train()  # switch back to train mode
-        model.zero_grad()
-        optimizer.zero_grad()
-        # logits = model(x_adv)
-        if transform is not None:
-            logits = model(transform(x_adv))
-        else:
-            logits = model(x_adv)
-        loss = self.criterion(logits, labels)
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.grad_clip)
-        optimizer.step()
-        acc_metric = MultiAccuracy()
-        acc_list = acc_metric(logits[:args.n_tasks], labels[:args.n_tasks])
-        acc_all = sum(acc_list) / len(acc_list)
-        self.acc_all_meters.update(acc_all, images.shape[0])
-        self.loss_meters.update(loss.item(), images.shape[0])
-        for i in range(args.n_tasks):
-            self.acc_meters[i].update(acc_list[i], images.shape[0])
-        payload = {
-            "loss": loss,
-            "loss_avg": self.loss_meters.avg,
-            "acc_all": acc_all,
-            "acc_all_avg": self.acc_all_meters.avg,
-            "lr": optimizer.param_groups[0]['lr'],
-            "|gn|": grad_norm
-        }
-        for i, acc in enumerate(acc_list):
-            payload[f"acc_{i}"] = acc
-            payload[f"acc_{i}_avg"] = self.acc_meters[i].avg
-        return payload
-
 class MultiAccuracy:
     def __init__(self, top_k=1):
         self.top_k = top_k
@@ -246,7 +193,7 @@ parser.add_argument('--universal_stop_error', default=0.5, type=float)
 parser.add_argument('--universal_train_target', default='train_subset', type=str)
 parser.add_argument('--train_step', default=10, type=int)
 parser.add_argument('--use_subset', action='store_true', default=False)
-parser.add_argument('--attack_type', default='min-min', type=str, choices=['min-min', 'min-min-max', 'min-max', 'random', 'mix', 'sep', 'sep_fa'], help='Attack type')
+parser.add_argument('--attack_type', default='min-min', type=str, choices=['min-min', 'min-max', 'random', 'mix', 'sep', 'sep_fa'], help='Attack type')
 parser.add_argument('--perturb_type', default='samplewise', type=str, choices=['classwise', 'samplewise'], help='Perturb type')
 parser.add_argument('--patch_location', default='center', type=str, choices=['center', 'random'], help='Location of the noise')
 parser.add_argument('--epsilon', default=8, type=float, help='perturbation')
@@ -538,46 +485,16 @@ def sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, sc
             optimizer_s.zero_grad()
             noise = model_s(images, labels, binary = False)
             perturb_img = images + noise
-            if args.attack_type == 'min-min-max':
-                perturb_img = perturb_img.detach()
-                if transform is not None:
-                    augmented_img = transform(images)
-                random_noise_max = torch.FloatTensor(*augmented_img.shape).uniform_(-args.epsilon/2, args.epsilon/2).to(device).requires_grad_()
-                for _ in range(args.num_steps):
-                    model.zero_grad()
-                    if transform is not None:
-                        augmented_perturb_img = transform(perturb_img)
-                        logits = model(augmented_perturb_img+random_noise_max)
-                    else:
-                        logits = model(perturb_img+random_noise_max)
-                    loss = criterion(logits, labels)
-                    grad = torch.autograd.grad(loss, random_noise_max, retain_graph=True)[0]
-                    eta = args.step_size/2 * grad.data.sign()
-                    random_noise_max = Variable(random_noise_max.data + eta, requires_grad=True)
-                    random_noise_max = Variable(torch.clamp(random_noise_max, -args.epsilon/2, args.epsilon/2), requires_grad=True)
-                random_noise_max = random_noise_max.clone().detach()
-                model.zero_grad()
-                model_s.zero_grad()
-                optimizer_s.zero_grad()
-                noise = model_s(images, labels, binary = False)
-                perturb_img = images + noise
-                if transform is not None:
-                    augmented_perturb_img = transform(perturb_img)
-                    logits = model(augmented_perturb_img+random_noise_max)
-                else:
-                    logits = model(perturb_img+random_noise_max)
-                loss = criterion(logits, labels)
+            if transform is not None:
+                augmented_perturb_img = transform(perturb_img)
+                logits = model(augmented_perturb_img)
             else:
-                if transform is not None:
-                    augmented_perturb_img = transform(perturb_img)
-                    logits = model(augmented_perturb_img)
-                else:
-                    logits = model(perturb_img)
-                if args.attack_type == 'min-min':
-                    loss = criterion(logits, labels)
-                elif args.attack_type == 'min-max':
-                    y = [(label + model.task_outputs[i]//2) % model.task_outputs[i] for i, label in enumerate(labels)]
-                    loss = criterion(logits, y)
+                logits = model(perturb_img)
+            if args.attack_type == 'min-min':
+                loss = criterion(logits, labels)
+            elif args.attack_type == 'min-max':
+                y = [(label + model.task_outputs[i]//2) % model.task_outputs[i] for i, label in enumerate(labels)]
+                loss = criterion(logits, y)
             loss_optimization = loss
             if args.embedding_regularization:
                 loss_ER_weight = 10
@@ -591,7 +508,7 @@ def sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, sc
             optimizer_s.step()
 
             if i % 10 == 0:
-                if 'min-max' in args.attack_type:
+                if args.attack_type == 'min-max':
                     labels = [(label + model.task_outputs[i]//2) % model.task_outputs[i] for i, label in enumerate(labels)]
                 acc_metric = MultiAccuracy()
                 acc_list = acc_metric(logits[:args.n_tasks], labels[:args.n_tasks])
@@ -613,7 +530,7 @@ def sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, sc
         scheduler_s.step()
 
         model_s.eval()
-        if 'min-max' in args.attack_type and not args.load_model:
+        if args.attack_type == 'min-min' and not args.load_model:
             # Train Batch for min-min noise
             for j in tqdm(range(0, args.train_step), total=args.train_step):
                 try:
@@ -633,10 +550,7 @@ def sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, sc
                 model.train()
                 for param in model.parameters():
                     param.requires_grad = True
-                if args.attack_type == 'min-min-max':
-                    trainer.adv_train_batch(images, labels, model, optimizer, transform = transform)
-                else:    
-                    trainer.train_batch(images, labels, model, optimizer, transform = transform)
+                trainer.train_batch(images, labels, model, optimizer, transform = transform)
 
         # Eval termination conditions
         loss_avg, error_rate = samplewise_perturbation_eval(criterion, model_s, data_loader, model, eval_target='train_dataset', transform = transform)
@@ -646,11 +560,7 @@ def sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, sc
         condition = error_rate > args.universal_stop_error
         condition = condition and (generation_steps < args.stop_epoch)
 
-        if args.attack_type == 'min-min-max':
-            save_freq = 10
-        else:
-            save_freq = 25
-        if generation_steps % save_freq == 0:
+        if generation_steps % 25 == 0:
             target_model = model_s.module if args.data_parallel else model_s
             state = {'model_state_dict': target_model.state_dict()}
             torch.save(state, os.path.join(args.exp_name, 'model_s.pth'))
@@ -956,7 +866,7 @@ def sample_wise_perturbation_mix(trainer, evaluator, model, criterion, optimizer
     return perturbations
 
 def main():
-    if not ('min-min' in args.attack_type):
+    if not (args.attack_type == 'min-min'):
         # Setup ENV
         datasets_generator = dataset.DatasetGenerator(train_batch_size=args.train_batch_size,
                                                       eval_batch_size=args.eval_batch_size,
@@ -1033,11 +943,11 @@ def main():
         trainer.global_step = ENV['global_step']
         logger.info("File %s loaded!" % (checkpoint_path_file))
 
-    if args.attack_type in ['min-min', 'min-min-max', 'min-max']:
+    if args.attack_type in ['min-min', 'min-max']:
         if args.attack_type in ['min-max'] and (not args.load_model):
             # min-max noise need model to converge first
             train(0, model, optimizer, scheduler, criterion, trainer, evaluator, ENV, data_loader)
-        if not ('min-min' in args.attack_type):
+        if not (args.attack_type == 'min-min'):
             del data_loader
         if args.perturb_type == 'samplewise':
             noise = sample_wise_perturbation(trainer, evaluator, model, criterion, optimizer, scheduler, model_s, optimizer_s, ENV)
